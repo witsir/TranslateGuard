@@ -1,0 +1,10 @@
+[project]
+name = "TranslateGuard"
+version = "0.0.1"
+dependencies = [
+    "undetected_chromedriver",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
