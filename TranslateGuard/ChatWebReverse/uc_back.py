@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from pathlib import Path
 
@@ -30,7 +31,7 @@ class SeleniumRequests:
             driver_executable_path=_get_driver_executable_path(),
             headless=headless)
         self.user = user
-        self._wait45 = WebDriverWait(self.driver, 45)
+        self._wait35 = WebDriverWait(self.driver, 45)
 
     @property
     def driver(self):
@@ -63,11 +64,11 @@ class SeleniumRequests:
         return user_agent_ua
 
     # noinspection PyTestUnpassedFixture
-    def fetch_access_token_cookies(self) -> tuple[list[dict], str] | list[dict]:
+    def fetch_access_token_cookies(self) -> tuple[list[dict], str, str]:
         """
         Fetches the cookies and access_token(auth_again = true) from /api/auth/session.
         """
-        self.chatgpt_login_with_cookies()
+        device_id = self.chatgpt_login_with_cookies()
         self.driver.get(f"https://chat.openai.com/api/auth/session")
         cookies = self.driver.get_cookies()
         save_cookies(self.user.EMAIL, cookies)
@@ -76,9 +77,9 @@ class SeleniumRequests:
         save_access_token(self.user.EMAIL, json_text)
         self.driver.quit()
         self._driver = None
-        return cookies, json.loads(json_text)["accessToken"]
+        return cookies, json.loads(json_text)["accessToken"], device_id
 
-    def chatgpt_login_with_cookies(self, headless: bool = True) -> bool:
+    def chatgpt_login_with_cookies(self, headless: bool = True) -> str:
         """
         Login to chat.openai.com with cookies.
         """
@@ -90,20 +91,20 @@ class SeleniumRequests:
         # Correct the inconsistent sameSite value exported by the EditThisCookie extension.
         for cookie in cookies_:
             try:
-                if cookie.get("sameSite") == "no_restriction":
-                    cookie["sameSite"] = "None"
-                elif cookie.get("sameSite") == "strict":
-                    cookie["sameSite"] = "Strict"
-                else:
-                    cookie.get("sameSite") == "Lax"
+                cookie["sameSite"] = "None"
                 self.driver.add_cookie(cookie)
             except (UnableToSetCookieException, AssertionError) as e:
                 logger.warning(f"{e.msg if type(e) is UnableToSetCookieException else str(e)} {cookie['name']}")
         self.driver.get('https://chat.openai.com')
         if headless:
             try:
-                if self._wait45.until(lambda x: x.find_element(By.XPATH, '//textarea[@id="prompt-textarea"]')):
-                    return True
+                if self._wait35.until(lambda x: x.find_element(By.XPATH, '//textarea[@id="prompt-textarea"]')):
+                    text = self.driver.page_source
+                    match = re.search(r'"DeviceId":\s*"([^"]*)"', text)
+                    if match:
+                        device_id = match.group(1)
+                        logger.debug(f"XXXXXXXXXXXXXXXDeviceId: {device_id}")
+                        return device_id
             except TimeoutException:
                 logger.error(ChatWebReverseErrorType.SELENIUM_TIMEOUT,
                              Service.ChatWebGpt,
@@ -116,7 +117,12 @@ class SeleniumRequests:
                 return self.chatgpt_login_with_cookies(False)
         while True:
             try:
-                if self._wait45.until(lambda x: x.find_element(By.XPATH, '//textarea[@id="prompt-textarea"]')):
-                    return True
+                if self._wait35.until(lambda x: x.find_element(By.XPATH, '//textarea[@id="prompt-textarea"]')):
+                    text = self.driver.page_source
+                    match = re.search(r'"DeviceId":\s*"([^"]*)"', text)
+                    if match:
+                        device_id = match.group(1)
+                        logger.debug(f"XXXXXXXXXXXXXXXDeviceId: {device_id}")
+                        return device_id
             except Exception as e:
                 logger.error(e)

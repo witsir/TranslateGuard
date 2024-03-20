@@ -141,7 +141,6 @@ async def hybrid_response(request, content: str) -> str:
         logger.debug("Merged translated paragraph(s):↓↓↓\n%s", paragraphs)
         return response_normal_json(config.PATTERN_SPLIT.join(paragraphs))
     except ChatWebReverseException as e:
-        if e.error_type == ErrorMsg.UnequalParagraphCountError:
-            return '{"ERROR":"UnequalParagraphCountError"}'
         logger.error(e)
-        return '{"ERROR":"FATAL"}'
+    except Exception as e:
+        logger.error(e)

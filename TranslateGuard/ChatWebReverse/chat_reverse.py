@@ -4,8 +4,6 @@ import json
 import re
 import uuid
 from asyncio import QueueFull
-from collections import namedtuple
-from dataclasses import dataclass
 
 import aiohttp
 
@@ -19,21 +17,10 @@ from .auth_handler import get_cookies, save_cookies, get_access_token
 from .exceptions import ChatWebReverseException, ChatWebReverseErrorType
 from .formatter import build_prompt_web_chat_gpt
 from .headers import get_headers_for_del_conversation, get_headers_for_general, get_headers_for_conversation, \
-    get_wss_headers
+    get_wss_headers, get_headers_for_openai
+from .model import User, Conversation
 from .playload import get_req_con_playload
 from .uc_back import SeleniumRequests
-
-User = namedtuple('User', ['EMAIL', 'PASSWORD', 'USE'])
-
-
-@dataclass
-class Conversation:
-    user: User
-    is_echo: bool = False
-    is_new: bool = True
-    conversation_id: str | None = None
-    current_node: str = str(uuid.uuid4())
-
 
 PATTERN_DATA = re.compile(r'data: (.*)', re.DOTALL)
 
@@ -52,6 +39,7 @@ class ChatgptAgent:
         self.websocket_request_id = str(uuid.uuid4())
         self.queue = asyncio.Queue(maxsize=1)
         self.proxy = "http://127.0.0.1:7890"
+        self.device_id = ''
 
     # @retry(e_type_list=[ErrorMsg.ConnectionError])
     async def del_conversation_remote(self, again: bool = False) -> bool | None:
@@ -123,18 +111,57 @@ class ChatgptAgent:
         Use selenium update cookies.
         """
         logger.warning(f"Will use selenium update cookies | Email: {self.user.EMAIL}")
-        self.cookies, self.access_token = await asyncio.to_thread(self.sl.fetch_access_token_cookies)
+        self.cookies, self.access_token, self.device_id = await asyncio.to_thread(self.sl.fetch_access_token_cookies)
         self._update_cookies_for_session(self.session)
+
+    async def _get_device_id(self, again=False):
+        """
+        """
+        resp = None
+        try:
+            resp = await self.session.get(
+                "https://chat.openai.com",
+                headers=get_headers_for_openai(),
+                proxy=self.proxy
+            )
+            self.session.cookie_jar.update_cookies(resp.cookies)
+            text = await resp.text()
+            logger.debug(DebugInfoMsg.RESPONSE_SUCCESS, Service.ChatWebGpt, self.user.EMAIL, text[:200])
+            match = re.search(r'"DeviceId":\s*"([^"]*)"', text)
+            logger.debug('XXXXXXXXXXXXXXXDeviceId', match.group(1))
+            if match:
+                self.device_id = match.group(1)
+        except aiohttp.ClientResponseError as e:
+            if 400 <= e.status < 500:
+                logger.error(ChatWebReverseErrorType.ERROR_4XX, Service.ChatWebGpt, self.user.EMAIL, e.status,
+                             e.message)
+                if not again:
+                    if not self.sl:
+                        self.sl = SeleniumRequests(self.user)
+                    await self._update_cookies()
+                    await self._get_device_id(again=True)
+                else:
+                    logger.error(ChatWebReverseErrorType.RETRY_FAILED, Service.ChatWebGpt, self.user.EMAIL,
+                                 e.status)
+            else:
+                logger.error(ChatWebReverseErrorType.ERROR_5XX, Service.ChatWebGpt, self.user.EMAIL, e.status,
+                             e.message)
+                if not again:
+                    await self._get_device_id(again=True)
+                else:
+                    logger.error(ChatWebReverseErrorType.RETRY_FAILED, Service.ChatWebGpt, self.user.EMAIL,
+                                 e.status)
+        except Exception as e:
+            logger.exception(e)
 
     async def register_websocket(self, again: bool = False):
         """
         Register websocket to fetch a wss_url.
         """
-        resp = None
         try:
             resp = await self.session.post(
                 "https://chat.openai.com/backend-api/register-websocket",
-                headers=get_headers_for_general(self.access_token),
+                headers=get_headers_for_general(self.access_token, self.device_id),
                 proxy=self.proxy
             )
             self.session.cookie_jar.update_cookies(resp.cookies)
@@ -171,7 +198,7 @@ class ChatgptAgent:
         """
         while True:
             try:
-                headers = get_wss_headers(self.conversation.conversation_id)
+                headers = get_wss_headers(self.device_id, self.conversation.conversation_id)
                 async with self.session.ws_connect(self.wss_url,
                                                    heartbeat=20,
                                                    headers=headers) as self.wss_client:
@@ -218,6 +245,33 @@ class ChatgptAgent:
                 logger.exception(e)
             await asyncio.sleep(5)
 
+    async def _chat_requirements(self, again: bool = False) -> str | None:
+        resp = None
+        try:
+            resp = await self.session.post(
+                "https://chat.openai.com/backend-api/sentinel/chat-requirements",
+                headers=get_headers_for_general(self.access_token, self.device_id),
+                proxy=self.proxy
+            )
+            self.session.cookie_jar.update_cookies(resp.cookies)
+            resp_json = await resp.json()
+            logger.debug(DebugInfoMsg.RESPONSE_SUCCESS, Service.ChatWebGpt, self.user.EMAIL, resp_json)
+            return resp_json["token"]
+        except aiohttp.ClientResponseError as e:
+            if e.status >= 500:
+                logger.error(ChatWebReverseErrorType.ERROR_5XX, Service.ChatWebGpt, self.user.EMAIL, e.status,
+                             resp.text)
+                if not again:
+                    return await self._chat_requirements(True)
+                else:
+                    logger.error(ChatWebReverseErrorType.RETRY_FAILED, Service.ChatWebGpt, self.user.EMAIL,
+                                 resp.status)
+            else:
+                raise
+        except Exception as e:
+            # logger.error(ErrorMsg.ConnectionError, Service.ChatWebGpt, self.user.EMAIL, str(e))
+            logger.exception(e)
+
     async def _complete_conversation(self,
                                      conversation: Conversation,
                                      headers: dict,
@@ -240,14 +294,13 @@ class ChatgptAgent:
                 self.conversation.is_new = False
                 self.conversation.is_echo = True
                 self.conversation.conversation_id = resp_json["conversation_id"]
-            try:
-                msg = await asyncio.wait_for(self.queue.get(), 45)
-                self.queue.task_done()
-                logger.info(DebugInfoMsg.TRANSLATED_TEXT, Service.ChatWebGpt, self.user.EMAIL, msg)
-                return msg
-            except asyncio.TimeoutError:
-                logger.debug(ErrorMsg.TimeOutError, Service.ChatWebGpt, self.user.EMAIL, "asyncio.queue")
-                raise
+            msg = await asyncio.wait_for(self.queue.get(), 45)
+            self.queue.task_done()
+            logger.info(DebugInfoMsg.TRANSLATED_TEXT, Service.ChatWebGpt, self.user.EMAIL, msg)
+            return msg
+        except asyncio.TimeoutError:
+            logger.debug(ErrorMsg.TimeOutError, Service.ChatWebGpt, self.user.EMAIL, "asyncio.queue")
+            raise
         except aiohttp.ClientResponseError as e:
             if e.status >= 500:
                 logger.error(ChatWebReverseErrorType.ERROR_5XX, Service.ChatWebGpt, self.user.EMAIL, e.status,
@@ -260,8 +313,7 @@ class ChatgptAgent:
             else:
                 raise
         except Exception as e:
-            logger.error(ErrorMsg.ConnectionError, Service.ChatWebGpt, self.user.EMAIL, str(e))
-            logger.exception(e)
+            raise
 
     async def ask_web_chat(self, prompt: str, again: bool = False) -> str | None:
         """
@@ -272,8 +324,11 @@ class ChatgptAgent:
                                             self.conversation.conversation_id,
                                             self.conversation.current_node,
                                             str(uuid.uuid4()))
-        headers = get_headers_for_conversation(self.access_token, self.conversation.conversation_id)
         try:
+            self.conversation.requirements_token = await self._chat_requirements()
+            headers = get_headers_for_conversation(self.access_token, self.device_id,
+                                                   self.conversation.requirements_token,
+                                                   self.conversation.conversation_id)
             text = await self._complete_conversation(self.conversation, headers, con_pay_load)
             return text
         except aiohttp.ClientResponseError as e:
@@ -284,11 +339,16 @@ class ChatgptAgent:
                 if not self.sl:
                     self.sl = SeleniumRequests(self.user)
                 await self._update_cookies()
-                headers = get_headers_for_conversation(self.access_token, self.conversation.conversation_id)
+                headers = get_headers_for_conversation(self.access_token, self.device_id,
+                                                       self.conversation.requirements_token,
+                                                       self.conversation.conversation_id)
                 return await self._complete_conversation(self.conversation, headers, con_pay_load)
             else:
                 logger.error(ChatWebReverseErrorType.RETRY_FAILED, Service.ChatWebGpt, self.user.EMAIL,
                              e.status)
+                raise
+        except Exception:
+            raise
 
     async def ask(self, paragraphs: list[str]) -> str | None:
         """
@@ -296,14 +356,16 @@ class ChatgptAgent:
         """
         prompt = build_prompt_web_chat_gpt(paragraphs)
         logger.info(DebugInfoMsg.PROMPT, Service.ChatWebGpt, self.user.EMAIL, prompt)
-        async with self.lock:
-            result = await self.ask_web_chat(prompt)
         try:
+            async with self.lock:
+                result = await self.ask_web_chat(prompt)
             if (resp := build_result(result, length=len(paragraphs), source=self.user.EMAIL)) is not None:
                 logger.debug(DebugInfoMsg.TRANSLATED_TEXT, Service.ChatWebGpt, self.user.EMAIL, resp)
                 return resp
         except UnequalParagraphCountException as e:
             logger.error(ErrorMsg.UnequalParagraphCountError, self.user.EMAIL, e.length_origin, e.length_result)
+            raise
+        except Exception:
             raise
 
 

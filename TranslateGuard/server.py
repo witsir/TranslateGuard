@@ -23,8 +23,10 @@ async def handle(request):
     content = json_data["messages"][1]["content"]
     logger.debug("immersive_translate json->messages->content:\n%s", content)
     text = await hybrid_response(request, content)
-    return web.json_response(text=text)
-
+    if text:
+        return web.json_response(text=text)
+    else:
+        return web.Response(status=500, text='内部服务器错误')
 
 async def start_background_tasks(app):
     for instance in app['chat_agent_pool'].instances.values():
